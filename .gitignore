@@ -1,0 +1,11 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+
+# Local financial statements and generated reports should never be committed.
+input/*
+output/*
+
+# Keep the directories themselves in the repo.
+!input/.gitkeep
+!output/.gitkeep
