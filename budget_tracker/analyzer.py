@@ -35,6 +35,23 @@ CHASE_CARD_CATEGORY_MAP = {
     "Shopping": "Shopping",
 }
 
+AMEX_CATEGORY_MAP = {
+    "Restaurant-Restaurant": "Dining",
+    "Restaurant-Bar & Café": "Dining",
+    "Merchandise & Supplies-Groceries": "Groceries",
+    "Merchandise & Supplies-Internet Purchase": "Shopping",
+    "Merchandise & Supplies-General Retail": "Shopping",
+    "Communications-Cable & Internet Comm": "Bills & Utilities",
+    "Transportation-Taxis & Coach": "Auto & Transport",
+    "Transportation-Parking Charges": "Auto & Transport",
+    "Transportation-Fuel": "Fuel",
+    "Travel-Airline": "Travel",
+    "Travel-Lodging": "Travel",
+    "Entertainment-Theatrical Events": "Entertainment",
+    "Entertainment-General Attractions": "Entertainment",
+    "Fees & Adjustments-Fees & Adjustments": "Fees & Adjustments",
+}
+
 CAPITAL_ONE_DESCRIPTION_OVERRIDES = [
     ("APNI MANDI", "Groceries"),
     ("TRADER JOE", "Groceries"),
@@ -60,6 +77,8 @@ CAPITAL_ONE_DESCRIPTION_OVERRIDES = [
     ("ITUNES", "Streaming & Subscriptions"),
     ("SPOTIFY", "Streaming & Subscriptions"),
     ("NETFLIX", "Streaming & Subscriptions"),
+    ("PEACOCK", "Streaming & Subscriptions"),
+    ("FOX ONE", "Streaming & Subscriptions"),
     ("YNP VALLEY LODGE RETAIL", "Travel & Souvenirs"),
 ]
 
@@ -361,6 +380,77 @@ def classify_chase_card(row: dict[str, str], source: Path) -> Transaction:
     )
 
 
+AMEX_MERCHANT_WIDTH = 20
+AMEX_LOCATION_WIDTH = 42
+
+
+def amex_merchant_field(description: str) -> str:
+    """Pull the merchant out of Amex's fixed-width description columns.
+
+    Amex pads location data into fixed positions: merchant in [0:20], city in
+    [20:40], state in [40:42]. The merchant name is often truncated and runs
+    straight into the city ("GglPay APNI MANDI FASUNNYVALE"), so the columns
+    have to be sliced before whitespace is collapsed. Rows without location
+    data ("MOBILE PAYMENT - THANK YOU") are left whole.
+    """
+    padded_merchant = description[:AMEX_MERCHANT_WIDTH].endswith(" ")
+    has_state = len(description) >= AMEX_LOCATION_WIDTH and description[40:42].isalpha()
+    merchant = description[:AMEX_MERCHANT_WIDTH] if padded_merchant or has_state else description
+    return clean_description(re.sub(r"^GglPay\s*", "", merchant.strip(), flags=re.IGNORECASE))
+
+
+def refine_amex_category(description: str, category: str) -> str:
+    upper = description.upper()
+
+    for needle, refined_category in CAPITAL_ONE_DESCRIPTION_OVERRIDES:
+        if needle in upper:
+            return refined_category
+
+    return category
+
+
+def classify_amex(row: dict[str, str], source: Path) -> Transaction:
+    raw_description = row["Description"] or ""
+    description = clean_description(raw_description)
+    raw_category = clean_description(row["Category"])
+    amount = parse_money(row["Amount"])
+    merchant_field = amex_merchant_field(raw_description)
+
+    # Amex categories are "Major-Minor"; fall back to the major half when the
+    # exact pair is not mapped so new subcategories still land somewhere sane.
+    category = AMEX_CATEGORY_MAP.get(raw_category)
+    if category is None:
+        category = raw_category.split("-")[0].strip() or "Uncategorized"
+    category = refine_amex_category(merchant_field, category)
+
+    # Amex signs charges positive and payments/credits negative, the opposite
+    # of the bank exports.
+    if amount < 0:
+        amount = abs(amount)
+        if "PAYMENT - THANK YOU" in description.upper():
+            category = "Credit Card Payment"
+            kind = "transfer"
+        else:
+            kind = "refund"
+    else:
+        amount = -amount
+        kind = "expense"
+
+    posted = parse_slash_date(row["Date"])
+    return Transaction(
+        posted_date=posted,
+        transaction_date=posted,
+        account="Amex Credit Card",
+        source=source.name,
+        description=description,
+        merchant=extract_merchant(merchant_field),
+        raw_category=raw_category,
+        category=category,
+        amount=amount,
+        kind=kind,
+    )
+
+
 def classify_robinhood_activity(row: dict[str, str], source: Path) -> Optional[Transaction]:
     description = clean_description(row["Description"])
     instrument = clean_description(row.get("Instrument", ""))
@@ -422,6 +512,8 @@ def parse_csv(source: Path) -> list[Transaction]:
             for tx in [classify_robinhood_activity(row, source)]
             if tx is not None
         ]
+    if {"Date", "Description", "Amount", "Extended Details", "Appears On Your Statement As"} <= headers:
+        return [classify_amex(row, source) for row in rows]
     if {"Details", "Posting Date", "Description", "Amount", "Type"} <= headers:
         return [classify_chase(row, source) for row in rows]
 
